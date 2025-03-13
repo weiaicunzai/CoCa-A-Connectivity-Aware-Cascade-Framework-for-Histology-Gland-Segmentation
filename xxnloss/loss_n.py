@@ -1,0 +1,939 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+"""Modified from https://github.com/LikeLy-Journey/SegmenTron/blob/master/
+segmentron/solver/loss.py (Apache-2.0 License)"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+#from pytorch_metric_learning import losses
+
+
+import skimage.morphology as morph
+from skimage import measure
+import numpy as np
+import cv2
+import unet3
+import time
+
+# 这是取n-1个大的
+
+def connected_components(image: torch.Tensor, num_iterations: int = 100) -> torch.Tensor:
+    r"""Computes the Connected-component labelling (CCL) algorithm.
+    .. image:: https://github.com/kornia/data/raw/main/cells_segmented.png
+    The implementation is an adaptation of the following repository:
+    https://gist.github.com/efirdc/5d8bd66859e574c683a504a4690ae8bc
+    .. warning::
+        This is an experimental API subject to changes and optimization improvements.
+    .. note::
+       See a working example `here <https://kornia-tutorials.readthedocs.io/en/latest/
+       connected_components.html>`__.
+    Args:
+        image: the binarized input image with shape :math:`(*, 1, H, W)`.
+          The image must be in floating point with range [0, 1].
+        num_iterations: the number of iterations to make the algorithm to converge.
+    Return:
+        The labels image with the same shape of the input image.
+    Example:
+        >>> img = torch.rand(2, 1, 4, 5)
+        >>> img_labels = connected_components(img, num_iterations=100)
+    """
+    if not isinstance(image, torch.Tensor):
+        raise TypeError(f"Input imagetype is not a torch.Tensor. Got: {type(image)}")
+
+    if not isinstance(num_iterations, int) or num_iterations < 1:
+        raise TypeError("Input num_iterations must be a positive integer.")
+
+    if len(image.shape) < 3 or image.shape[-3] != 1:
+        raise ValueError(f"Input image shape must be (*,1,H,W). Got: {image.shape}")
+
+    with torch.no_grad():
+        H, W = image.shape[-2:]
+        image_view = image.view(-1, 1, H, W)
+
+        # precompute a mask with the valid values
+        mask = image_view == 1
+
+        # allocate the output tensors for labels
+        B, _, _, _ = image_view.shape
+        out = torch.arange(B * H * W, device=image.device, dtype=image.dtype).view((-1, 1, H, W))
+        out[~mask] = 0
+
+        for _ in range(num_iterations):
+            out[mask] = F.max_pool2d(out, kernel_size=3, stride=1, padding=1)[mask]
+
+        return out.view_as(image)
+#
+
+import time
+from functools import wraps
+
+def time_execution(func):
+    @wraps(func)
+    def wrapper(self, args, kwargs):
+        t1 = time.time()
+        func(self, *args, **kwargs)
+        t2 = time.time()
+        print(t2 - t1)
+    return wrapper
+
+class GlandContrastLoss(nn.Module):
+    def __init__(self, num_nagative,area=0, rate=30,temperature=0.07, ignore_idx=255):
+        super().__init__()
+        print("GlandContrastLoss",num_nagative)
+        #self.grid_size = grid_size
+        self.num_nagative = num_nagative
+        self.op = 'xor'
+        self.rate = rate
+        self.area = area
+        print(f'rate:{rate}')
+        self.temperature = temperature
+        self.base_temperature = 0.1
+        #self.infonce_loss_fn = losses.NTXentLoss(temperature=0.07)
+        self.store_values = {
+        }
+
+        self.ignore_idx = ignore_idx
+
+        self.total_time = 0
+        self.total_samples = 0
+
+    # @time_execution
+    def segment_level_loss(self, gt, pred, op='xor', out_size=(160, 160)):
+
+        gt = cv2.resize(gt, out_size[::-1], interpolation=cv2.INTER_NEAREST)
+        pred = cv2.resize(pred, out_size[::-1], interpolation=cv2.INTER_NEAREST)
+        count_over_conn = 0
+        count_under_conn = 0
+        if op == 'none':
+            return np.zeros(gt.shape, dtype=np.uint8)
+        pred[gt==self.ignore_idx] = 0
+        pred = morph.remove_small_objects(pred == 1, connectivity=1)
+        gt = morph.remove_small_objects(gt == 1, connectivity=1)
+
+        pred_labeled, pred_num = measure.label(pred, return_num=True, connectivity=1)
+        gt_labeled, gt_num = measure.label(gt, return_num=True, connectivity=1)
+
+        results = []
+        #pred
+        res = np.zeros(gt.shape, dtype=np.uint8)
+        ans = np.zeros(gt.shape, dtype=np.uint8)
+        process_list=[]
+        rate = self.rate
+        # 记录过欠连接
+        pred_process_list = []
+        pred_betti_over_num = []
+        for i in range(0, pred_num):
+            i += 1
+            pred_labeled_i = pred_labeled == i
+            mask = (pred_labeled_i) & (gt != 0)
+            if len(gt_labeled[mask]) == 0:
+                res[pred_labeled_i] = 1
+                ans[pred_labeled_i] = 1
+                count_over_conn += 1
+                continue
+            if gt_labeled[mask].min() != gt_labeled[mask].max():
+                res[pred_labeled_i] = 1
+                gt_unique_values=np.unique(gt_labeled[mask])
+                pred_betti_over_num.append(len(gt_unique_values)-1)
+                new_pic = np.zeros(gt.shape, dtype=np.uint8)            
+                for value in gt_unique_values:
+                    new_pic[gt_labeled == value] = 1
+                w = unet3.weight_add_np(new_pic, rate)
+                w = w / w.max() 
+                process_list.append(w)
+                pred_process_list.append(w)
+                count_over_conn += 1
+
+            else:
+                # corresponding gt gland area is less than 50%
+                if mask.sum() / pred_labeled_i.sum() < 0.5:
+                    #res[pred_labeled == i] = 1
+                    res[pred_labeled_i] = 1
+                    ans[pred_labeled_i] = 1
+                    count_over_conn += 1
+
+        results.append(res)
+
+        res = np.zeros(gt.shape, dtype=np.uint8)
+        gt_process_list = []
+        gt_betti_over_num = []
+        for i in range(0, gt_num):
+            i += 1
+            gt_labeled_i = gt_labeled == i
+            #mask = (gt_labeled == i) & (pred != 0)
+            mask = gt_labeled_i & (pred != 0)
+
+            if len(pred_labeled[mask]) == 0:
+                res[gt_labeled_i] = 1
+                ans[gt_labeled_i] = 1
+                count_under_conn += 1
+                continue
+
+            if pred_labeled[mask].min() != pred_labeled[mask].max():
+                res[gt_labeled_i] = 1
+                count_under_conn += 1
+                # 处理pred
+                pred_unique_values=np.unique(pred_labeled[mask])
+                gt_betti_over_num.append(len(pred_unique_values) - 1)
+                new_pic = np.zeros(pred.shape, dtype=np.uint8)
+                
+                for value in pred_unique_values:
+                    new_pic[pred_labeled == value] = 1
+                    
+                w = unet3.weight_add_np(new_pic, rate)
+                w = w / w.max() 
+                process_list.append(w)
+                gt_process_list.append(w)
+
+            else:
+                if mask.sum() / gt_labeled_i.sum() < 0.5:
+                    res[gt_labeled_i] = 1
+                    ans[gt_labeled_i] = 1
+                    count_under_conn += 1
+
+        results.append(res)
+
+
+        res = cv2.bitwise_or(results[0], results[1])
+
+        if op == 'or':
+            return res
+
+        elif op == 'xor':
+
+            #cc = res.copy()
+            gt_res = np.zeros(gt.shape, dtype=np.uint8)
+            for i in range(0, gt_num):
+                i += 1
+                if res[gt_labeled == i].max() != 0:
+                    gt_res[gt_labeled == i] = 1
+
+            pred_res = np.zeros(gt.shape, dtype=np.uint8)
+            for i in range(0, pred_num):
+                i += 1
+                if res[pred_labeled == i].max() != 0:
+                    pred_res[pred_labeled == i] = 1
+
+            res = cv2.bitwise_xor(pred_res, gt_res)
+            for index, pic in enumerate(process_list):
+                pic_xor = pic * res
+                ans[pic_xor >= self.area]=1
+            # 记录最大的
+            max_1_ans = np.zeros(gt.shape, dtype=np.uint8)
+            for index, pic in enumerate(pred_process_list):
+                pic = unet3.return_n_betti(pic,pred_betti_over_num[index])
+                pic_xor = pic * res
+                max_1_ans[pic_xor!=0]=1
+            for index, pic in enumerate(gt_process_list):
+                pic = unet3.return_n_betti(pic,gt_betti_over_num[index])
+                pic_xor = pic * res
+                max_1_ans[pic_xor!=0]=1
+            return ans,max_1_ans
+        else:
+            raise ValueError('operation not suportted')
+
+    def segment_mask(self, gts, preds, op='or', out_size=(160, 160)):
+        bs = gts.shape[0]
+        preds = np.argmax(preds, axis=1)
+        t1 = time.time()
+        
+        # res, max_1_ans = [self.segment_level_loss(gt=gts[b], pred=preds[b], op=op, out_size=out_size) for b in range(bs)]
+        results = [self.segment_level_loss(gt=gts[b], pred=preds[b], op=op, out_size=out_size) for b in range(bs)]
+        res = [res1[0] for res1 in results]
+        max_1_ans = [res1[1] for res1 in results]
+        t2 = time.time()
+        
+        self.total_time += (t2 - t1)
+        self.total_samples += bs
+        # print('avg time:', self.total_time / self.total_samples)
+        #import sys; sys.exit()
+        res = np.stack(res, axis=0)
+        max_1_ans = np.stack(max_1_ans, axis=0)
+        return res, max_1_ans
+
+    def _compute_indices(self, mask_tensor, num_samples_keep):
+        #assert tensor.dim() == 4
+        #population = tensor.permute(0, 2, 3, 1)
+        #mask_tensor.
+        #print(mask_tensor.shape)
+        mask_tensor = mask_tensor.contiguous().view(-1)
+        t_indices = mask_tensor.nonzero()
+        #print(t_indices.shape, 'ccccccccc')
+        num_samples = t_indices.shape[0]
+        perm = torch.randperm(num_samples)
+
+        idx = t_indices[perm[:num_samples_keep]]
+        #print(idx)
+
+        #return population[idx]
+
+        return idx
+
+
+    def _sample_feats_even(self, pred_logits, candidate_mask, gt_seg, ignore_mask):
+
+        assert candidate_mask.dim() == 4
+        assert gt_seg.shape == candidate_mask.shape
+
+        # masks of  xor_mask
+
+
+        batch_size = pred_logits.shape[0]
+        logits_dim = pred_logits.shape[1]
+
+        # check if there is an image do not contain any object (value == 1 is object)
+        # mask shape: [B, 1]
+        mask = candidate_mask.sum(dim=(2, 3)) == 0
+
+        # assign the gt gland to the non-gland image
+        candidate_mask[mask] = gt_seg[mask].long()
+
+        #if 'candidate_mask_gland' in self.store_values.keys():
+        #    self.store_values['candidate_mask_bg'] = [g for g in candidate_mask.clone()]
+        #else:
+        #    self.store_values['candidate_mask_gland'] = [g for g in candidate_mask.clone()]
+
+
+        # randomly sample k elements in candidate_mask
+        candidate_mask = candidate_mask + torch.rand(candidate_mask.shape, device=candidate_mask.device)
+        candidate_mask[ignore_mask] = 0
+
+        _, candidate_indices = candidate_mask.view(batch_size, -1).topk(k=self.num_nagative, dim=-1)
+
+
+        pred_logits = pred_logits.permute(0, 2, 3, 1).view(batch_size, -1, logits_dim)
+        candidate_indices = candidate_indices.unsqueeze(-1).expand(-1, -1, pred_logits.shape[-1])
+        out = torch.gather(input=pred_logits, index=candidate_indices, dim=1)
+
+        return out
+
+
+
+
+    def hard_sampling_even(self, pred_logits, gt_seg, xor_mask):
+        #sample hard examples for each image in a batch evenly
+
+        # sampling feat from a 4D tensor
+        assert pred_logits.dim() == 4
+        batch_size, dim, h, w = pred_logits.shape
+        #h = 480
+        #w = 480
+
+        labels = gt_seg.unsqueeze(1).float().clone()
+        labels = torch.nn.functional.interpolate(labels, (h, w), mode='nearest').long()
+        #labels = gt_seg.unsqueeze(1)
+
+        xor_mask = xor_mask.unsqueeze(1).float().clone()
+        xor_mask = torch.nn.functional.interpolate(xor_mask, (h, w), mode='nearest').long()
+
+
+
+
+
+        #self.store_values['xor_mask'] = [xo for xo in xor_mask]
+        #self.store_values['labels'] = [la for la in labels.clone()]
+
+
+        gland_gt = labels == 1
+
+        #values = torch.amax(gland_gt, dim=(-1, -2))
+        #assert values.sum() == gland_gt.shape[0]
+
+
+        gland_hard_mask = gland_gt * xor_mask
+
+        #self.store_values['gland_hard_mask'] = [gland for gland in gland_hard_mask.clone()]
+
+
+        bg_gt = labels == 0
+
+        bg_hard_mask = bg_gt * xor_mask
+
+        #values = torch.amax(bg_hard_mask, dim=(-1, -2))
+        #assert values.sum() == bg_hard_mask.shape[0]
+        #self.store_values['bg_hard_mask'] = [gland for gland in bg_hard_mask.clone()]
+
+        ignore_mask = labels == self.ignore_idx
+
+        gland_feats = self._sample_feats_even(pred_logits, gland_hard_mask, labels == 1, ignore_mask)
+        bg_feats = self._sample_feats_even(pred_logits, bg_hard_mask, labels == 0, ignore_mask)
+
+
+        return gland_feats, bg_feats
+
+        # if no gland in an image
+        #mask_gland = gland_hard_mask.sum(dim=(2, 3)) == 0
+
+        ## assign the gt gland to the non-gland image
+        #print(gland_hard_mask.shape, labels.shape)
+        #gland_hard_mask[mask_gland] = labels[mask_gland]
+
+        #gland_hard_mask = gland_hard_mask + torch.rand(gland_hard_mask.shape, device=gland_hard_mask)
+
+
+        #print(mask_gland)
+        #print(mask_gland.shape)
+        #print(mask_gland == 0)
+        #print(gland_hard_mask.shape)
+        #gland_feats = []
+        #for batch_idx in range(batch_size):
+
+        #    gland_mask = gland_hard_mask[batch_idx]
+
+        #    # sample hard gland pixels:
+        #    if gland_hard_mask.sum() == 0:
+        #        gland_mask = (gt_seg == 1).long()
+
+        #    gland_indices = self._compute_indices(gland_mask, self.num_nagative)
+        #    gland_logits = pred_logits[batch_idx]
+
+        #    if
+        #    bg_indices = self._compute_indices(gland_mask, self.num_nagative)
+
+
+
+        #    gland_feats.append()
+
+
+
+
+
+    def hard_sampling(self, pred_logits, gt_seg, xor_mask):
+        #batch_size = pred_logits.shape[0]
+        #dim = pred_logits.shape[1]
+        #print(pred_logits.shape)
+        #print(pred_logits.shape)
+        #print(gt_seg.shape)
+        #pred_logits
+        #h = pred_logits.shape[-2]
+        #w = pred_logits.shape[-1]
+        assert pred_logits.dim() == 4
+        batch_size, dim, h, w = pred_logits.shape
+        #print(gt_seg.dtype)
+        labels = gt_seg.unsqueeze(1).float().clone()
+        labels = torch.nn.functional.interpolate(labels, (h, w), mode='nearest').long()
+
+        xor_mask = xor_mask.unsqueeze(1).float().clone()
+        xor_mask = torch.nn.functional.interpolate(xor_mask, (h, w), mode='nearest').long()
+        #print(xor_mask.shape)
+
+        gland_hard_mask = labels & xor_mask
+        gt_inv = ~labels
+        bg_hard_mask = gt_inv & xor_mask
+
+        #gland_indices = gland_hard.nonzero()
+        #num_gland = gland_indices.shape[0]
+        #perm = torch.randperm(num_gland)
+
+        #bg_indices = gland_hard.nonzero()
+        #num_bg = bg_indices.shape[0]
+        #print(gland_hard)
+        #print(pred_logits.shape, gland_hard.squeeze(1).shape)
+
+        #flattened
+
+        gland_indices = self._compute_indices(gland_hard_mask, self.num_nagative * batch_size)
+        bg_indices = self._compute_indices(bg_hard_mask, self.num_nagative * batch_size)
+        #print(gland_indices.shape)
+        #print(bg_indices.shape)
+
+        population = pred_logits.permute(0, 2, 3, 1)
+        population = population.contiguous().view(-1, dim)
+        #print(gland_indices[0], population.shape)
+        #print(population[].shape)
+        #import sys; sys.exit()
+        #print(population.shape, gland_indices.shape)
+        gland_feats = population[gland_indices]
+        bg_feats = population[bg_indices]
+        #print(gland_feats.shape, bg_feats.shape)
+        #return gland_indices, bg_indices
+
+        #print(gland_indices.shape)
+
+
+
+
+        # samples [B, num_classes, num_samples_per_class, logits_dim]
+
+        return gland_feats, bg_feats
+
+
+    # def compute_loss(self, feat, y_feat, queue):
+    #     assert feat.shape == pos_feat.shape
+    #     assert pos_queue.shape == neg_queue.shape
+
+
+    #     queue_y = torch.cat([
+    #         torch.zeros(queue.shape, device=queue.device, dtype=torch.long),
+    #         torch.ones(queue.shape, device=queue.device, dtype=torch.long)
+    #     ], dim=0)
+    #     print(queue_y)
+    #     queue_feat = queue.view(queue.shape[0] * queue.shape[1], queue.shape[2])
+    #     #queue_y = torch.
+
+
+    #     # neg feat
+    #     # negative logits: Nx1 #N is the number of pixels sample perclass
+    #     neg = torch.einsum('nc,nc->n', [feat, neg_feat]).unsqueeze(-1)
+
+    #     # pos queue
+    #     # positive logits: Nxk #k is the length of queue
+    #     pos = torch.einsum('nc,ck->nk', [feat, pos_queue.clone().detach()])
+
+    #     # neg queue
+    #     # negative logits: Nxk
+
+   # def contrasive(self, gland_feats, bg_feats, queue):
+
+   #     pos_gland = torch.einsum('n')
+
+    def infonce(self, logits_pos, logits_neg):
+        numberator = torch.exp(logits_pos / self.temperature)
+        denominator = torch.exp(logits_neg / self.temperature).sum(dim=1).unsqueeze(-1) + numberator
+        log_exp = -torch.log((numberator / denominator)).sum(dim=1) / logits_pos.shape[-1]
+
+        return log_exp.mean()
+
+    def contrasive_single_class(self, anchor, postive, negative):
+        #print(anchor.shape, postive.T.shape)
+
+        #num_pos = postive.shape[0]
+        
+        # 进行爱因斯坦求和约定运算
+        logits_pos = torch.einsum('nc, ck->nk', [anchor, postive.T])
+        logits_neg = torch.einsum('nc, ck->nk', [anchor, negative.T])
+        # print(logits_pos.shape)
+        # torch.Size([32, 1000])
+        # exit(1)
+
+        #numberator = torch.exp(logits_pos / self.temperature)
+        #denominator = torch.exp(logits_neg / self.temperature).sum(dim=1).unsqueeze(-1) + numberator
+        #log_exp = -torch.log((numberator / denominator)).sum(dim=1) / logits_pos.shape[-1]
+
+        #exp_pos = torch.exp(logits_pos / self.temperature)
+        #exp_neg = torch.exp(logits_neg / self.temperature)
+        #exp_neg_sum = exp_neg.sum(dim=-1)
+        #log_exp = -torch.log(exp_pos / (exp_neg_sum + exp_pos)).sum(dim=-1) / logits_pos.shape[-1]
+
+        return self.infonce(logits_pos, logits_neg)
+
+
+        #return log_exp.mean()
+
+
+
+
+
+
+
+
+    def constrasive(self, x_feat, labels, queue):
+        assert queue.dim() == 3
+
+        num_classes, q_len, dim = queue.shape
+        batch_size, num_samples = x_feat.shape[0], x_feat.shape[1]
+
+
+        assert dim == x_feat.shape[-1]
+
+        assert x_feat.shape[0] == labels.shape[0]
+
+
+
+        # 20000, 1
+        # q_len * num_classes
+        queue_y = torch.cat([
+            torch.zeros([1, q_len], device=queue.device, dtype=torch.long),
+            torch.ones([1, q_len], device=queue.device, dtype=torch.long)
+        ], dim=0).view(-1, 1)
+
+
+        queue_feat = queue.view(-1, dim) ###########################################
+
+        labels = labels.contiguous().view(-1, 1)
+        #print(labels.shape, queue_y.shape) [12, 1] * [10000, 1]
+        mask = torch.eq(labels, queue_y.T).float()
+
+
+        #x_feat = x_feat.view(batch_size * num_samples, dim)
+
+        #print(x_feat.device, queue_feat.device)
+        #print(x_feat.shape, queue_feat.T.shape) torch.Size([12, 2, 256]) torch.Size([256, 10000])
+        x_feat = torch.nn.functional.normalize(x_feat, dim=1, p=2)
+        #print(x_feat.shape)
+        #print((x_feat[0] * x_feat[0]).sum())
+        similirity_feat_queue = torch.div(torch.matmul(x_feat, queue_feat.T),
+                                        self.temperature)
+
+        #print(similirity_feat_queue.max())
+        # torch.Size([12, 2, 10000])
+        # print(similirity_feat_queue.shape)
+        # print(queue_y.shape, feat_queue.shape)
+        logits_max, _ =  torch.max(similirity_feat_queue, dim=1, keepdim=True)
+
+        logits = (similirity_feat_queue - logits_max.detach())
+
+        neg_mask = 1 - mask
+        #print(neg_maamk)
+
+        #gland_feats = gland_feats.view(-1, gland_feats.shape[-1])
+        #bg_feats = bg_feats.view(-1, bg_feats.shape[-1])
+
+        #pos =
+
+        # logits_mask = torch.ones_like(mask).scatter_(1,
+        #                                              torch.arange(batch_size).view(-1, 1).cuda(),
+        #                                              0)
+        #self.compute_loss(gland_feats, )
+        #print(logits_mask.shape)
+        #mask = mask * logits_mask
+
+        exp_logits = torch.exp(logits) # [num_samples, q_len]
+        pos_logits = exp_logits * mask + 1e-7
+
+        # sum of all negative samples
+        neg_logits = exp_logits * neg_mask + 1e-7
+        #print(neg_logits.shape) [num_samples, q_len]
+        neg_logits = neg_logits.sum(1, keepdim=True)
+
+        log_prob = torch.log(pos_logits) - torch.log(pos_logits + neg_logits)
+        #print(log_prob)
+        #print(log_prob.shape)
+
+
+        mean_log_prob_pos = log_prob.sum(1) / mask.sum(1)
+        #print(mean_log_prob_pos.shape)
+
+        loss = - mean_log_prob_pos.mean()
+        #loss = loss.mean()
+        #print('loss', loss)
+
+        return loss
+
+
+
+
+
+
+        # 0 galnd 1 bg
+#        anchor_feats = torch.stack(
+#            [
+#                gland_feats.view(-1, gland_feats.shape[-1]),
+#                bg_feats.view(-1, bg_feats.shape[-1])
+#            ], dim=0)
+#
+        #pos = torch.einsum('nc, nc->n')
+
+        #pos = anchor_feats
+
+    def _dequeue_and_enqueue(self, gland_feats, bg_feats, queue, queue_ptr):
+        #batch_size, num_samples, dim = gland_feats.shape
+        num_feats, dim = gland_feats.shape
+        num_classes, q_len, dim = queue.shape
+
+        ptr = queue_ptr[0].long().item()
+
+        feats = torch.stack(
+            [
+                #gland_feats.view(-1, dim),
+                #bg_feats.view(-1, dim)
+                gland_feats,
+                bg_feats
+            ],
+            dim=0
+        )
+
+        #feats = torch.nn.functional.normalize(feats, dim=2, p=2)
+        #print(feats[1, 3, :30])
+
+        start = ptr
+        end = ptr + num_feats
+        #print(start, end)
+
+        #print(feats.shape, queue.shape, start, end)
+        if end  > q_len - 1:
+            queue[:, - num_feats:, :] = feats
+            queue_ptr[0] = 0
+
+        else:
+            queue[:, start : end, :] = feats
+            queue_ptr[0] = end
+
+    #def my_infonce(self, gland, labels):
+
+    def compute_loss(self, feats, queue):
+
+        embedings = torch.cat([
+            feats[:1, :],
+            queue,
+        ])
+
+        labels = torch.arange(
+        )
+        labels[:feats.shape[0]] = 0
+        print(embedings.shape, labels.shape)
+
+        return self.infonce_loss_fn(embedings, labels)
+
+    def _save_img(self, t, save_path):
+        #print(gt_seg.shape)
+
+        for i in enuermt:
+            #print(i.shape)
+
+            img_name = os.path.join(save_path, '{}.jpg')
+            print(img_name)
+
+            i.permute(1, 2, 0)
+
+
+    def cal_uncertain_mask(self, pred_logits, mask):
+        pred_probs = pred_logits.softmax(dim=1)
+        diff = torch.abs(pred_probs[:, 0, :, :] - pred_probs[:, 1, :, :])
+        out = diff
+        out = out * mask
+        return out
+
+
+    def compute_sample_weight(self, gt_seg, uncertain_mask, class_id):
+
+        gt_mask = gt_seg == class_id
+        object_hard_mask = gt_mask * uncertain_mask
+
+        #object_mask = object_hard_mask
+        weight_mask = object_hard_mask.sum(dim=(-1, -2)) == 0
+        object_hard_mask[weight_mask] = gt_mask[weight_mask].float()
+
+        ignore_mask = gt_seg == self.ignore_idx
+
+        object_hard_mask[ignore_mask] = 0
+
+        return object_hard_mask
+
+
+    def indices_to_points(self, indices, H, W):
+        #x =
+        #print(indices.dtype)
+        row = torch.div(indices, H, rounding_mode='trunc') / (H - 1)
+        # print(row)
+
+        col = indices % W / (W - 1)
+        # print(col.shape)
+        # exit(1)
+        #print('indices', indices)
+        #print('row', row)
+        #print('col', col)
+        # torch.Size([8, 4, 2])
+        xy = torch.stack([col, row], dim=-1)
+
+
+        return xy
+
+    def denormalize(self, grid):
+        """Denormalize input grid from range [0, 1] to [-1, 1]
+
+        Args:
+            grid (torch.Tensor): The grid to be denormalize, range [0, 1].
+
+        Returns:
+            torch.Tensor: Denormalized grid, range [-1, 1].
+        """
+
+        return grid * 2.0 - 1.0
+
+    def point_sample(self, feats, points, align_corners):
+
+        add_dim = False
+        #print(feats.shape, points.shape, 'befiore')
+        if points.dim() == 3:
+            add_dim = True
+            points = points.unsqueeze(2)
+            output = F.grid_sample(
+                feats, self.denormalize(points), align_corners=align_corners)
+        if add_dim:
+            output = output.squeeze(3)
+        #print(feats.shape, points.shape, output.shape, 'after')
+
+        output = output.permute(0, 2, 1)
+        return output
+
+    def get_points_train(self, gt_seg, uncertain_mask):
+        batch_size, H, W = gt_seg.shape
+
+        assert gt_seg.shape == uncertain_mask.shape
+
+        # cal sample weight
+        gland_weight = self.compute_sample_weight(gt_seg, uncertain_mask, class_id=1)
+        bg_weight = self.compute_sample_weight(gt_seg, uncertain_mask, class_id=0)
+        # sample accordint to weights
+        gland_indices = torch.multinomial(gland_weight.view(batch_size, -1), self.num_nagative, replacement=False)
+        try:
+           bg_indices = torch.multinomial(bg_weight.view(batch_size, -1), self.num_nagative, replacement=False)
+        except:
+            print('except...........')
+            bg_indices = torch.zeros(batch_size, self.num_nagative, device=gland_indices.device)
+        gland_points = self.indices_to_points(gland_indices, H, W)
+        bg_indices = self.indices_to_points(bg_indices, H, W)
+
+        return gland_points, bg_indices
+
+
+
+    def multi_level_point_sample(self, feats, points, align_corners, fcs):
+        out = 0
+        #for _, values in feats.items():
+
+        out += fcs[0](self.point_sample(feats['low_level'], points, align_corners))
+        # print(out.shape)
+        out += fcs[1](self.point_sample(feats['layer2'], points, align_corners))
+        # print(out.shape)
+        out += fcs[2](self.point_sample(feats['aux'], points, align_corners))
+        # print(out.shape)
+        out += fcs[3](self.point_sample(feats['out'], points, align_corners))
+        return out
+
+
+
+    def forward(self, feats, pred_logits, gt_seg, queue=None, queue_ptr=None, fcs=None):
+
+
+        self.store_values = {}
+
+        with torch.no_grad():
+
+            mask, max_1_ans = self.segment_mask(gts=gt_seg.detach().cpu().numpy(),                                
+                                     preds=pred_logits.detach().cpu().numpy(), 
+                                     op=self.op, out_size=gt_seg.shape[-2:])
+            mask = torch.tensor(mask, dtype=gt_seg.dtype, device=gt_seg.device)
+            max_1_ans = torch.tensor(max_1_ans, dtype=gt_seg.dtype, device=gt_seg.device)
+            self.store_values['mask'] = mask
+            uncertain_mask = self.cal_uncertain_mask(pred_logits, mask)
+            self.store_values['uncertain'] = uncertain_mask
+            gland_points, bg_points = self.get_points_train(gt_seg, uncertain_mask)
+        gland_feats = self.multi_level_point_sample(feats, gland_points, align_corners=True, fcs=fcs)
+        bg_feats = self.multi_level_point_sample(feats, bg_points, align_corners=True, fcs=fcs)
+        gland_feats = torch.nn.functional.normalize(gland_feats.contiguous().view(-1, gland_feats.shape[-1]), dim=1, p=2)
+        bg_feats = torch.nn.functional.normalize(bg_feats.contiguous().view(-1, bg_feats.shape[-1]), dim=1, p=2)
+        gland_queue = queue[0]
+        bg_queue = queue[1]
+        gland_loss = self.contrasive_single_class(anchor=gland_feats, postive=gland_queue.detach(), negative=bg_queue.detach())
+        bg_loss = self.contrasive_single_class(anchor=bg_feats, postive=bg_queue.detach(), negative=gland_feats.detach())
+        loss = (self.temperature / self.base_temperature) * (gland_loss + bg_loss) / 2
+        with torch.no_grad():
+            self._dequeue_and_enqueue(gland_feats.detach(), bg_feats.detach(), queue, queue_ptr)
+        return loss, uncertain_mask, max_1_ans
+
+from .utils import weighted_loss
+
+
+
+@weighted_loss
+def dice_loss(pred,
+              target,
+              valid_mask,
+              smooth=1,
+              exponent=2,
+              class_weight=None,
+              ignore_index=255):
+    assert pred.shape[0] == target.shape[0]
+    total_loss = 0
+    num_classes = pred.shape[1]
+    for i in range(num_classes):
+        if i != ignore_index:
+            dice_loss = binary_dice_loss(
+                pred[:, i],
+                target[..., i],
+                valid_mask=valid_mask,
+                smooth=smooth,
+                exponent=exponent)
+            if class_weight is not None:
+                dice_loss *= class_weight[i]
+            total_loss += dice_loss
+    return total_loss / num_classes
+
+
+@weighted_loss
+def binary_dice_loss(pred, target, valid_mask, smooth=1, exponent=2, **kwargs):
+    assert pred.shape[0] == target.shape[0]
+    pred = pred.reshape(pred.shape[0], -1)
+    target = target.reshape(target.shape[0], -1)
+    valid_mask = valid_mask.reshape(valid_mask.shape[0], -1)
+
+    num = torch.sum(torch.mul(pred, target) * valid_mask, dim=1) * 2 + smooth
+    den = torch.sum(pred.pow(exponent) + target.pow(exponent), dim=1) + smooth
+
+    return 1 - num / den
+
+
+# @LOSSES.register_module()
+class DiceLoss(nn.Module):
+    """DiceLoss.
+    This loss is proposed in `V-Net: Fully Convolutional Neural Networks for
+    Volumetric Medical Image Segmentation <https://arxiv.org/abs/1606.04797>`_.
+    Args:
+        smooth (float): A float number to smooth loss, and avoid NaN error.
+            Default: 1
+        exponent (float): An float number to calculate denominator
+            value: \\sum{x^exponent} + \\sum{y^exponent}. Default: 2.
+        reduction (str, optional): The method used to reduce the loss. Options
+            are "none", "mean" and "sum". This parameter only works when
+            per_image is True. Default: 'mean'.
+        class_weight (list[float] | str, optional): Weight of each class. If in
+            str format, read them from a file. Defaults to None.
+        loss_weight (float, optional): Weight of the loss. Default to 1.0.
+        ignore_index (int | None): The label index to be ignored. Default: 255.
+        loss_name (str, optional): Name of the loss item. If you want this loss
+            item to be included into the backward graph, `loss_` must be the
+            prefix of the name. Defaults to 'loss_dice'.
+    """
+
+    def __init__(self,
+                 smooth=1,
+                 exponent=2,
+                 reduction='mean',
+                 class_weight=None,
+                 loss_weight=1.0,
+                 ignore_index=255,
+                 loss_name='loss_dice',
+                 **kwargs):
+        super(DiceLoss, self).__init__()
+        self.smooth = smooth
+        self.exponent = exponent
+        self.reduction = reduction
+        # self.class_weight = get_class_weight(class_weight)
+        self.class_weight = class_weight
+        self.loss_weight = loss_weight
+        self.ignore_index = ignore_index
+        self._loss_name = loss_name
+
+    def forward(self,
+                pred,
+                target,
+                avg_factor=None,
+                reduction_override=None,
+                **kwargs):
+        assert reduction_override in (None, 'none', 'mean', 'sum')
+        reduction = (
+            reduction_override if reduction_override else self.reduction)
+        if self.class_weight is not None:
+            class_weight = pred.new_tensor(self.class_weight)
+        else:
+            class_weight = None
+
+        pred = F.softmax(pred, dim=1)
+        num_classes = pred.shape[1]
+        one_hot_target = F.one_hot(
+            torch.clamp(target.long(), 0, num_classes - 1),
+            num_classes=num_classes)
+        valid_mask = (target != self.ignore_index).long()
+
+        loss = self.loss_weight * dice_loss(
+            pred,
+            one_hot_target,
+            valid_mask=valid_mask,
+            reduction=reduction,
+            avg_factor=avg_factor,
+            smooth=self.smooth,
+            exponent=self.exponent,
+            class_weight=class_weight,
+            ignore_index=self.ignore_index)
+        return loss
