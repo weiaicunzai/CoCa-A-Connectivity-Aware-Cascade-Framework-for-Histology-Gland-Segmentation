@@ -6,6 +6,7 @@ sys.path.append(os.getcwd())
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 #from models.backbones.resnet import resnet50d
 import models.backbones.resnet as resnet
@@ -226,13 +227,6 @@ class GraphNet(nn.Module):
         return nodes.view(B, C, self.node_num).contiguous(), soft_assign
 
 
-#class Attention(nn.Module):
-#    def __init__(self, project_ratio=8):
-#        self.project = self.neck = nn.Sequential(
-#            nn.Linear(, 2048),
-#            nn.ReLU(inplace=True),
-#            nn.Linear(2048, 256)
-#        )
 
 
 class GCU(nn.Module):
@@ -397,23 +391,66 @@ class BasicLinear(nn.Module):
         )
 
     def forward(self, x):
+        # print(x.shape)
         x = self.fc(x)
+        # print(x.shape)
+        # exit(0)
         return x
 
+
+class Attention(nn.Module):
+    def __init__(self, dim, batch,vetex, heads = 4, dim_head = 16, dropout = 0.):
+        super().__init__()
+        inner_dim = dim_head *  heads
+        project_out = not (heads == 1 and dim_head == dim)
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+        self.down_3_pool = nn.AvgPool2d(kernel_size=3, stride=3)
+        self.norm = nn.LayerNorm(dim)
+
+        self.attend = nn.Softmax(dim = -1)
+        self.dropout = nn.Dropout(dropout)
+
+        self.to_q = nn.Linear(dim, inner_dim , bias = False)
+        # 可学习的
+        self.to_kv = nn.Parameter(torch.randn(batch, heads,vetex, dim_head))
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        ) if project_out else nn.Identity()
+
+    def forward(self, x):
+        # 防止内存爆炸
+        B1,C1,H1,W1 = x.shape
+        x = self.down_3_pool(x)
+        B2,C2,H2,W2 = x.shape
+        x = x.view(B2, C2, -1).transpose(1, 2)
+        B, L, N = x.shape
+        x = self.norm(x)
+        q = self.to_q(x)
+        q = rearrange(q, 'b n (h d) -> b h n d', h = self.heads)
+        k = self.to_kv
+        v = self.to_kv
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = self.attend(dots)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        self.to_out(out)
+        # 变回2维，使用线性插值，进行放大
+        out = out[:B2]
+        out = out.transpose(1,2).view(B2,C2,H2,W2)
+        out = F.interpolate(out, size=(H1, W1), mode='bilinear', align_corners=False)
+        return out
 
 class TG(nn.Module):
     def __init__(self, backbone, num_classes):
         super().__init__()
         self.backbone = backbone
-        #self.graph_head_dim = 512
-        #self.graph_head_dim = 256
         self.hidden_dim = 64
-        # self.hidden_dim = 128
-        # self.graph_head_dim = 256
-
         self.project = nn.Sequential(
-            # nn.Conv2d(256, 48, 1, bias=False),
-            # nn.Conv2d(self.hidden_dim, 48, 1, bias=False),
             nn.Conv2d(self.hidden_dim, 48, 1, bias=False),
             nn.BatchNorm2d(48),
             nn.ReLU(inplace=True),
@@ -438,7 +475,8 @@ class TG(nn.Module):
         # self.register_buffer("queue", torch.randn(num_classes, q_len, 2))
         self.queue = nn.functional.normalize(self.queue, p=2, dim=2)
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-
+        
+        self.attention =  Attention(dim=64,vetex=2,batch=8, heads=4, dim_head=16, dropout=0.1)
         self.fcs =  nn.ModuleList(
             [
                 #BasicLinear(256, 256),
@@ -453,45 +491,6 @@ class TG(nn.Module):
             ]
         )
 
-        #self.neck = nn.Sequential(
-        #    nn.Linear(2048, 2048),
-        #    nn.ReLU(inplace=True),
-        #    nn.Linear(2048, 256)
-        #)
-        #self.out = nn.Sequential(
-        #    nn.Conv2d(self.graph_head_dim + 48, 256, 1, padding=1, bias=False),
-        #    nn.BatchNorm2d(256),
-        #    nn.ReLU(inplace=True),
-        #)
-
-        #self.queue = nn.Parameter(num_classes, 5000, 256)
-        #self.register_buffer("queue", torch.randn(num_classes, 5000, 256))
-        #self.queue = nn.functional.normalize(self.queue, p=2, dim=2)
-        #self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-
-        #self.head = FCNHead()
-        #self.cls_head = UpSample2d(
-        #    320,
-        #    num_classes,
-        #    scale_factor=2
-        #)
-        #self.head = DualGCNHead(
-        #    2048,
-        #    512,
-        #    num_classes
-        #)
-        #self.cls_head = nn.Sequential(
-        #self.gland_head = GlandHead(32, 512)
-
-        #self.out = nn.Sequential(
-        #    BasicConv2d(
-        #        in_channels=512,
-        #        out_channels=256,
-        #        kernel_size=1
-        #    ),
-        #    #BasicConv2d(512, num_classes, 1)
-        #)
-
         self.gland_head_project = nn.Sequential(
             BasicConv2d(
                 # in_channels=2048,
@@ -502,7 +501,8 @@ class TG(nn.Module):
                 kernel_size=1
             )
         )
-        # self.gland_head = GraphHead(dim=self.graph_head_dim)
+        # self.gland_head = GraphHead(dim=64)
+        # self.gland_head = Attention(q2)
 
         self.aux_head = nn.Sequential(
             BasicConv2d(
@@ -515,11 +515,7 @@ class TG(nn.Module):
             # BasicConv2d(512, num_classes, 1)
             BasicConv2d(self.hidden_dim * 2, num_classes, 1)
         )
-        #self.aux_head = BasicConv2d(
-        #    BasicConv2d(1024, 512),
-        #    BasicConv2d(512, num_classes)
-        #)
-        #self.fcs = nn.
+
 
 
     def forward(self, x, hook=None):
@@ -529,13 +525,15 @@ class TG(nn.Module):
 
         feats = self.backbone(x)
         low_level_feat = self.project(feats['low_level']) #  120x120
-
+        # torch.Size([8, 64, 60, 60])
         gland_feats = self.gland_head_project(feats['out']) # 60x60
+        
+        
         # gland = self.gland_head(gland_feats, queue=self.queue.detach(), hook=hook) # layer 4
-        # print(gland_feats.shape, gland.shape)
-        gland = gland_feats
-
-
+     
+        # gland = gland_feats
+        gland = self.attention(gland_feats)
+        # 整张量gland的大小
         gland = F.interpolate(
             gland,
             #size=(H, W),
@@ -544,30 +542,8 @@ class TG(nn.Module):
             mode='bilinear'
         )
 
-        #feats['gland'] = gland
-
-        #concat_inputs = torch.cat([gland, low_level_feat], dim=1)
         gland = torch.cat([gland, low_level_feat], dim=1)
 
-
-        #feats[]
-        #for key, value in feats.items():
-            #print(key, value.shape)
-
-
-
-
-        #concat_inputs = self.out(concat_inputs)
-        #gland = self.out(gland)
-
-        #sample = gland
-
-
-        #concat_inputs = F.interpolate(
-
-       #classify before interploate
-        #gland = self.classifier(output)
-        #sampler = gland
         gland = self.classifier(gland)
 
         # output this value......
@@ -579,10 +555,6 @@ class TG(nn.Module):
             align_corners=True,
             mode='bilinear'
         )
-
-
-
-
         if not self.training:
             return gland
 
@@ -593,14 +565,6 @@ class TG(nn.Module):
             align_corners=True,
             mode='bilinear'
         )
-        # torch.Size([8, 2, 480, 480])
-        # print(gland.shape)
-        # torch.Size([8, 2, 480, 480])
-        # print(aux.shape)
-        # dict
-        # print(feats.shape)
-        # exit(0)
-        
         return gland, aux, feats
 
 
@@ -629,18 +593,19 @@ def tg(num_classes):
     # import sys; sys.exit()
     return net
 
-
-#net = tg(2)
-###print(sum(p.numel() for p in net.parameters() if p.requires_grad))
-###print(sum(p.numel() for p in net.backbone.parameters() if p.requires_grad))
-####print(sum([p.numel() ]))
-#img = torch.randn(3, 3, 480, 480)
-###
-#output = net(img)
-
-
-
-#print(output.shape)
-
-#for x in output:
-    #print(x.shape)
+if __name__ == "__main__":
+    net = tg(2)
+    ##print(sum(p.numel() for p in net.parameters() if p.requires_grad))
+    ##print(sum(p.numel() for p in net.backbone.parameters() if p.requires_grad))
+    ###print(sum([p.numel() ]))
+    img = torch.randn(3, 3, 480, 480)
+    output ,o1,o2= net(img)
+    print(output.shape)
+    print(o1.shape)
+    print(o2['low_level'].shape)
+    print(o2['layer2'].shape)
+    print(o2['aux'].shape)
+    print(o2['out'].shape)
+    # for param in net.parameters():
+    print(net)
+    # print(o2.keys())

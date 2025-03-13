@@ -22,7 +22,7 @@ class Attention(nn.Module):
         # self.to_v = nn.Linear(dim, inner_dim , bias = False)
         # 可学习的
         self.to_k = nn.Parameter(torch.randn(batch, heads,vetex, dim_head))
-        self.to_v = nn.Parameter(torch.randn(batch, heads,vetex, dim_head))
+        # self.to_v = nn.Parameter(torch.randn(batch, heads,vetex, dim_head))
 
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
@@ -45,7 +45,7 @@ class Attention(nn.Module):
         q = self.to_q(x)
         q = rearrange(q, 'b n (h d) -> b h n d', h = self.heads)
         k = self.to_k
-        v = self.to_v
+        v = self.to_k
         # q = torch.rand((2, 8, 2,64))
         # k = torch.rand((2, 8, 2,64))
         # v = torch.rand((2, 8, 2,64))
@@ -68,6 +68,7 @@ class Attention(nn.Module):
         # out
         self.to_out(out)
         # 变回2维，使用线性插值，进行放大
+        out = out[:B2]
         out = out.transpose(1,2).view(B2,C2,H2,W2)
         out = F.interpolate(out, size=(H1, W1), mode='bilinear', align_corners=False)
         print(f'out2-{out.shape}')
@@ -84,7 +85,7 @@ def main():
     att_layer = Attention(dim=dim,vetex=2,batch=2, heads=heads, dim_head=dim_head, dropout=dropout)
 
     # 创建一个随机输入张量，形状为(batch_size, seq_len, dim)
-    x = torch.rand((2, 64, 60,60))  # 示例中的batch_size为2，seq_len为32
+    x = torch.rand((1, 64, 60,60))  # 示例中的batch_size为2，seq_len为32
 
     # 使用注意力层处理输入张量
     out = att_layer(x)

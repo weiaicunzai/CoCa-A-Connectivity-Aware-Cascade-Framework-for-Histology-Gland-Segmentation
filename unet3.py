@@ -7,13 +7,15 @@ from skimage.measure import label
 from scipy.ndimage.morphology import distance_transform_edt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from skimage.io import imsave
-
+from skimage import measure
 def rgb2gray(rgb):
     return np.dot(rgb[..., :3], [0.299, 0.587, 0.114]) #分别对应通道 R G B
 def weight_add(path,rate):
     gt = io.imread(path)
     # print(type(gt))
     gt = 1 * (gt > 0)
+    print(gt.shape)
+    print((gt==1).sum())
     # 【1】计算细胞和背景的像素频率
     c_weights = np.zeros(2)
     c_weights[0] = 1.0 / ((gt == 0).sum())
@@ -87,30 +89,49 @@ def get_gt(path):
     gt = 1 * (gt > 0)
     return gt
     
-# image_path = '/data/hdd1/by/House-Prices-Advanced-Regression-Techniques/data/Warwick QU Dataset (Released 2016_07_08)/testA_25_anno.bmp' 
-image_x_path = '/home/xuxinan/mmCode2/evalAns/4eval_xor.png'
-image_path = '/home/xuxinan/mmCode2/evalAns/4eval_pred.png'
-# for rate in range(10, 101, 5):
-#     w = weight_add(image_path,rate)
-#     w = w / w.max() * 255.0
-#     w = w.astype(np.uint8)
-#     imsave(f'unet/{rate}unet_pred.png', w) 
-#     w1 = get_gt(image_x_path)
-#     ans = w * w1
-#     ans = ans / ans.max() * 255.0
-#     ans = ans.astype(np.uint8)
-#     imsave(f'unet/{rate}unet_xor.png', ans) 
-rate=30
-w = weight_add(image_path,rate)
-w = w / w.max() * 255.0
-w = w.astype(np.uint8)
-imsave(f'{rate}unet_pred.png', w) 
-w1 = get_gt(image_x_path)
-ans = w * w1
-ans = ans / ans.max() * 255.0
-ans = ans.astype(np.uint8)
-imsave(f'{rate}unet_xor.png', ans) 
-print("ok")
+
+
+
+# exit(0)
+
+# w1 = get_gt(image_x_path)
+# ans = w * w1
+# ans = ans / ans.max() * 255.0
+# ans = ans.astype(np.uint8)
+# imsave(f'{rate}unet_xor.png', ans) 
+# print("ok")
+
+
+
+def process_and_label(ans, threshold=0.3, connectivity=1):
+    """
+    对 ans 数组进行阈值处理，并标记连通区域。
+
+    :param ans: 输入的 NumPy 数组
+    :param threshold: 阈值，默认为 0.3
+    :param connectivity: 连通性类型，1 表示 4 连通，2 表示 8 连通
+    :return: 标记后的数组和连通组件的数量
+    """
+    # 将大于阈值的元素设置为 1，其余的设置为 0
+    binary_ans = ans.copy()
+    binary_ans[ans > threshold] = 1
+    binary_ans[ans <= threshold] = 0
+    
+    # 标记连通区域
+    pred_labeled, pred_num = measure.label(binary_ans, return_num=True, connectivity=connectivity)
+    
+    # 计算每个连通区域的面积并排序
+        # 获取每个连通区域的属性
+    regions = measure.regionprops(pred_labeled)
+    areas = [(region.area, region) for region in regions]
+    areas.sort(key=lambda x: x[0], reverse=True)  # 按面积从大到小排序
+    
+    # 获取前5个最大面积的连通组件（如果没有那么多，则全部列出）
+    top_areas = [area[0] for area in areas[:5]]
+    
+    return pred_labeled, pred_num, top_areas
+
+
 # print(np.unique(w), w.max(), w.min())
 # w1 = get_gt(image_path)
 # print(f"w: {w}, type(w): {type(w)}")
@@ -131,3 +152,62 @@ print("ok")
 # np.savetxt('unet3.txt', ans, fmt='%1.3f')
 # imsave('unet3.png', ans) 
 # imsave('unet3.png', w) 
+
+
+def return_n_betti(ans, n=1, threshold=0.35, connectivity=1):
+    """
+    根据给定的阈值和连通性，返回满足条件的前n个最大区域。
+    如果最大区域的面积超过最小区域面积的5倍，则减少返回的区域数，直到满足条件。
+    """
+    # 将大于阈值的元素设置为 1，其余的设置为 0
+    binary_ans = ans.copy()
+    binary_ans[ans > threshold] = 1
+    binary_ans[ans <= threshold] = 0
+    
+    pred_labeled, pred_num = measure.label(binary_ans, return_num=True, connectivity=connectivity)
+    
+    regions = measure.regionprops(pred_labeled)
+    areas = [(region.area, region) for region in regions]
+    areas.sort(key=lambda x: x[0], reverse=True)  # 按面积从大到小排序
+    
+    selected_areas = []
+    for i in range(min(n, len(areas))):
+        if i == 0 or (selected_areas and areas[i][0] * 3 >= selected_areas[-1][0]):
+            selected_areas.append(areas[i])
+        else:
+            break
+    
+    # 准备返回的数据：创建一个新的numpy数组，仅包含所选区域，并将这些区域标记为1
+    result_array = np.zeros_like(binary_ans)
+    for area, region in selected_areas:
+        coords = region.coords
+        result_array[coords[:, 0], coords[:, 1]] = 1
+    
+    # 返回结果：标注的图像、总连通组件的数量以及选定的区域面积
+    return result_array
+
+if __name__ == "__main__":
+    # image_path = '/data/hdd1/by/House-Prices-Advanced-Regression-Techniques/data/Warwick QU Dataset (Released 2016_07_08)/testA_25_anno.bmp' 
+    image_x_path = '/home/xuxinan/mmCode2/evalAns/4eval_xor.png'
+    # image_path = '/home/xuxinan/mmCode2/evalAns/4eval_pred.png'
+    image_path = '/home/xuxinan/mmCode2/3square.png'
+    # for rate in range(10, 101, 5):
+    #     w = weight_add(image_path,rate)
+    #     w = w / w.max() * 255.0
+    #     w = w.astype(np.uint8)
+    #     imsave(f'unet/{rate}unet_pred.png', w) 
+    #     w1 = get_gt(image_x_path)
+    #     ans = w * w1
+    #     ans = ans / ans.max() * 255.0
+    #     ans = ans.astype(np.uint8)
+    #     imsave(f'unet/{rate}unet_xor.png', ans) 
+    rate=30
+    w = weight_add(image_path,rate)
+    print(w.max())
+    w = w / w.max() * 255.0
+    w = w.astype(np.uint8)
+    imsave(f'3sq{rate}unet_pred.png', w) 
+
+    arr = return_n_betti(w)
+    print(arr.shape)
+    # print(top)
