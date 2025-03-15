@@ -445,6 +445,77 @@ class Attention(nn.Module):
         out = F.interpolate(out, size=(H1, W1), mode='bilinear', align_corners=False)
         return out
 
+
+
+class AttentionBY(nn.Module):
+    def __init__(self, dim, vetex, heads = 4, dim_head = 16, dropout = 0.):
+        super().__init__()
+        inner_dim = dim_head *  heads
+        project_out = not (heads == 1 and dim_head == dim)
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+        # self.down_3_pool = nn.AvgPool2d(kernel_size=3, stride=3)
+        self.norm = nn.LayerNorm(dim)
+
+        self.attend = nn.Softmax(dim = -1)
+        self.dropout = nn.Dropout(dropout)
+
+        self.to_q = nn.Linear(dim, inner_dim , bias = False)
+        # 可学习的
+        self.to_kv = nn.Parameter(torch.randn(vetex, dim))
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        ) if project_out else nn.Identity()
+
+    def forward(self, x):
+        # 防止内存爆炸
+        # B1,C1,H1,W1 = x.shape
+        # x = self.down_3_pool(x)
+        B2,C2,H2,W2 = x.shape
+        x = x.view(B2, C2, -1).transpose(1, 2)
+        B, L, N = x.shape
+        x = self.norm(x)
+        q = self.to_q(x)
+        q = rearrange(q, 'b n (h d) -> b h n d', h = self.heads)
+        k = self.to_kv.unsqueeze(dim=0)
+        v = k
+        
+        k = rearrange(k, 'b n (h d) -> b h n d', h = self.heads)
+        v = k
+        # print(v.shape, v.shape)
+        
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = self.attend(dots)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        self.to_out(out)
+        # 变回2维，使用线性插值，进行放大
+        # out = out[:B2]
+        
+        out = out.transpose(1,2).view(B2,C2,H2,W2)
+        out = F.interpolate(out, size=(H2, W2), mode='bilinear', align_corners=False)
+        return out
+
+class Attn(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attention1 = AttentionBY(dim=64, vetex=2)
+        self.attention2 = AttentionBY(dim=64, vetex=4)
+        self.attention3 = AttentionBY(dim=64, vetex=8)
+        self.attention4 = AttentionBY(dim=64, vetex=16)
+    
+    def forward(self, x):
+        x1 = self.attention1(x)
+        x2 = self.attention2(x)
+        x3 = self.attention3(x)
+        x4 = self.attention4(x)
+        
+        return x1 + x2 + x3 + x4
+    
 class TG(nn.Module):
     def __init__(self, backbone, num_classes):
         super().__init__()
@@ -476,7 +547,9 @@ class TG(nn.Module):
         self.queue = nn.functional.normalize(self.queue, p=2, dim=2)
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
         
-        self.attention =  Attention(dim=64,vetex=2,batch=8, heads=4, dim_head=16, dropout=0.1)
+        # self.attention =  Attention(dim=64,vetex=16,batch=8, heads=4, dim_head=16, dropout=0.1)
+        self.attention = Attn()
+        
         self.fcs =  nn.ModuleList(
             [
                 #BasicLinear(256, 256),
