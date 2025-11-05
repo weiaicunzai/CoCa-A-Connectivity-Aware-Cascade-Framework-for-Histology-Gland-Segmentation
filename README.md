@@ -23,7 +23,10 @@ python train.py
 ```
 
 
-@inproceedings{10.1145/3581783.3613779,
+## Citation
+
+```
+@inproceedings{
 author = {Bai, Yu and Zhang, Bo and Zhang, Zheng and Liu, Wu and Li, Jinwen and Gong, Xiangyang and Wang, Wendong},
 title = {CoCa: A Connectivity-Aware Cascade Framework for Histology Gland Segmentation},
 year = {2023},
@@ -32,5 +35,6 @@ pages = {1598–1606},
 numpages = {9},
 keywords = {connectivity-aware, gland segmentation, graph neural convolution, supervised contrastive learning},
 }
+```
 
 
