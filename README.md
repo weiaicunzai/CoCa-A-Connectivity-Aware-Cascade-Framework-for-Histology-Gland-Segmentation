@@ -39,8 +39,6 @@ title = {CoCa: A Connectivity-Aware Cascade Framework for Histology Gland Segmen
 year = {2023},
 booktitle = {Proceedings of the 31st ACM International Conference on Multimedia},
 pages = {1598–1606},
-numpages = {9},
-keywords = {connectivity-aware, gland segmentation, graph neural convolution, supervised contrastive learning},
 }
 ```
 
